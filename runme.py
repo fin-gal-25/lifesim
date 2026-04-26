@@ -29,8 +29,8 @@ BASE_METABOLISM = 0.02
 MOVEMENT_COST = 0.08
 SENSOR_COST = 0.012
 ARMOR_COST = 0.025
-CROWD_PENALTY_START = 5
-CROWD_PENALTY_PER_EXTRA = 0.004
+CROWD_PENALTY_START = 2           # теперь с 2 организмов в клетке
+CROWD_PENALTY_PER_EXTRA = 0.012   # повышен штраф
 
 MINERAL_TO_ENERGY = 18.0
 ORGANIC_TO_ENERGY = 22.0
@@ -51,14 +51,14 @@ class AlifeWorld:
         self.organic = np.zeros((H, W))
         self.o2 = np.full((H, W), 0.01)
 
-        # Температура и свет (широтная зависимость)
+        # Температура и свет
         y_idx = np.linspace(-1, 1, H)[:, None]
         temp_1d = 0.6 + 0.3 * np.cos(y_idx * np.pi)
         light_1d = 0.4 + 0.5 * (1 - np.abs(y_idx))
         self.temp = np.broadcast_to(temp_1d, (H, W))
         self.light = np.broadcast_to(light_1d, (H, W))
 
-        # Источники минералов (маленькие пятна, чтобы движение было выгодным)
+        # Источники минералов (вулканы)
         self.vents = self.rng.random((H, W)) < 0.015
 
         # Организмы
@@ -69,7 +69,6 @@ class AlifeWorld:
         self.age = np.zeros(MAX_ORG)
         self.genes = np.zeros((MAX_ORG, G))
 
-        # Базовый геном + начальный шум
         base_genome = np.array([0.8, 0.2, 0.1, 0.05, 0.0, 0.0,
                                 0.0, 0.0, 0.0, 0.0, 0.0, 0.8])
         for i in range(self.N):
@@ -126,28 +125,22 @@ class AlifeWorld:
         self.mutation_boost_ticks = 80
 
     def _kill_and_compact(self):
-        """Удаляет мёртвых, добавляет органику, сжимает массивы"""
         old_N = self.N
         active = slice(0, old_N)
-
         dead = (self.energy[active] <= 0.05) | (self.age[active] > 500)
-
         if dead.any():
             np.add.at(
                 self.organic,
                 (self.y[active][dead], self.x[active][dead]),
                 0.05
             )
-
         keep = ~dead
         new_N = int(keep.sum())
-
         self.x[:new_N] = self.x[active][keep]
         self.y[:new_N] = self.y[active][keep]
         self.energy[:new_N] = self.energy[active][keep]
         self.age[:new_N] = self.age[active][keep]
         self.genes[:new_N] = self.genes[active][keep]
-
         self.N = new_N
 
     # ---------- Основной шаг ----------
@@ -200,8 +193,10 @@ class AlifeWorld:
             self.organic[y, x] -= organic_taken
             gain += organic_taken * ORGANIC_TO_ENERGY
 
-            # Фотосинтез
-            photo_gain = self.light[y, x] * g[GEN_PHOTOSYNTHESIS] * PHOTO_GAIN_BASE
+            # Фотосинтез – с разделением света
+            local_crowd = max(1, occupancy[y, x])
+            light_share = self.light[y, x] / local_crowd
+            photo_gain = light_share * g[GEN_PHOTOSYNTHESIS] * PHOTO_GAIN_BASE
             gain += photo_gain
 
             # Кислородное дыхание (усилитель)
@@ -233,7 +228,10 @@ class AlifeWorld:
             if crowd > CROWD_PENALTY_START:
                 cost += (crowd - CROWD_PENALTY_START) * CROWD_PENALTY_PER_EXTRA
 
-            o2_damage = o2_local * (1 - g[GEN_O2_TOLERANCE]) * 0.2
+            # Кислородный урон – пороговая формула
+            o2_excess = max(0.0, o2_local - g[GEN_O2_TOLERANCE] * 0.25)
+            o2_damage = o2_excess * 0.6
+
             temp_damage = max(0.0, abs(self.temp[y, x] - 0.6) - 0.2) * 0.1
 
             self.energy[i] += gain - cost - o2_damage - temp_damage
@@ -241,7 +239,6 @@ class AlifeWorld:
         # ----- 2. Смерть и компактизация -----
         self._kill_and_compact()
         if self.N == 0:
-            # Всё вымерло – прекращаем (но обычно так не бывает)
             return
 
         # ----- 3. Движение (случайный порядок) -----
@@ -259,7 +256,7 @@ class AlifeWorld:
             x, y = self.x[i], self.y[i]
             neigh = [(x+dx, y+dy) for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]]
             neigh = [(nx % W, ny % H) for nx, ny in neigh]
-            self.rng.shuffle(neigh)   # чтобы не было системного движения вправо
+            self.rng.shuffle(neigh)
 
             best_score = -1e9
             best_move = (x, y)
@@ -273,7 +270,6 @@ class AlifeWorld:
                         score += (1 - self.o2[ny, nx]) * g[GEN_SENSOR_O2]
                     elif g[GEN_O2_RESPIRATION] > 0:
                         score += self.o2[ny, nx] * g[GEN_SENSOR_O2]
-                # небольшой шум для разрушения симметрии
                 score += self.rng.normal(0.0, 1e-6)
                 if score > best_score:
                     best_score = score
@@ -283,7 +279,7 @@ class AlifeWorld:
                 self.x[i], self.y[i] = best_move
                 self.energy[i] -= MOVEMENT_COST
 
-        # ----- 4. Размножение (случайный порядок, дети не участвуют в этом шаге) -----
+        # ----- 4. Размножение (случайный порядок, дети не участвуют) -----
         parent_N = self.N
         for i in self.rng.permutation(parent_N):
             if self.energy[i] <= 0:
@@ -301,21 +297,31 @@ class AlifeWorld:
                 self.genes[idx] = child_genes
                 self.N += 1
 
-        # ----- 5. Выделение кислорода (связано с фотосинтезом) -----
+        # ----- 5. Выделение кислорода (с разделением света) -----
+        o2_occupancy = np.zeros((H, W), dtype=int)
+        for i in range(self.N):
+            o2_occupancy[self.y[i], self.x[i]] += 1
+
         o2_prod = np.zeros((H, W))
         for i in range(self.N):
             if self.energy[i] <= 0:
                 continue
             x, y = self.x[i], self.y[i]
             g = self.genes[i]
-            # Кислород как отход фотосинтеза
-            prod = g[GEN_O2_PRODUCTION] * g[GEN_PHOTOSYNTHESIS] * self.light[y, x] * 0.02
+            local_crowd = max(1, o2_occupancy[y, x])
+            light_share = self.light[y, x] / local_crowd
+            prod = (
+                g[GEN_O2_PRODUCTION]
+                * g[GEN_PHOTOSYNTHESIS]
+                * light_share
+                * 0.02
+            )
             o2_prod[y, x] += prod
         self.o2 += o2_prod * 0.1
         self.o2 *= 0.999
         np.clip(self.o2, 0.0, 1.0, out=self.o2)
 
-        # ----- 6. Уменьшение мутационного буста (раз в тик) -----
+        # ----- 6. Уменьшение мутационного буста -----
         if self.mutation_boost_ticks > 0:
             self.mutation_boost_ticks -= 1
 
@@ -327,7 +333,6 @@ class AlifeWorld:
             self.o2_history.pop(0)
             self.pop_history.pop(0)
 
-        # Печать средних генов для наблюдения
         if self.t % 100 == 0 and self.N > 0:
             m = self.genes[:self.N].mean(axis=0)
             print(
@@ -364,7 +369,7 @@ def main():
     world = AlifeWorld(seed=7)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-    ax1.set_title("ALife v0.1 – Artificial Life")
+    ax1.set_title("ALife v0.2 – свет делится, толпа кусается")
     img = ax1.imshow(world.render(), interpolation='nearest')
     ax2.set_title("Population and O₂")
     line_pop, = ax2.plot([], [], 'g-', label='Population / MAX')
